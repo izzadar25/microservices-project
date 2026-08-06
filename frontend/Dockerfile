@@ -10,6 +10,9 @@ WORKDIR /app
 ENV NODE_ENV=production \
     PORT=3000
 
+# curl is needed so we can verify service-to-service connectivity with kubectl exec + curl
+RUN apk add --no-cache curl
+
 COPY --from=deps /app/node_modules ./node_modules
 COPY server.js .
 COPY package.json .

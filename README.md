@@ -95,3 +95,11 @@ kubectl get nodes -o wide
 - [x] `kubectl cluster-info` shows the control plane running
 - [x] `kubectl get nodes` shows control-plane + worker node(s) as `Ready`
 - [x] `kind-microservices-cluster` context available via `kubectl config get-contexts`
+
+### Note: curl added to runtime images
+The base Dockerfiles from Week 1 didn't include `curl`, so `kubectl exec ... -- curl` failed with
+`executable file not found in $PATH`. Both Dockerfiles were updated to install `curl` in the final
+runtime stage (`apk add --no-cache curl` for the Alpine-based frontend, `apt-get install curl` for
+the Debian-slim backend), images were rebuilt, reloaded into kind with `kind load docker-image`,
+and Deployments were force-refreshed with `kubectl rollout restart` since the image tag itself
+didn't change.
