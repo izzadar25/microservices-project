@@ -1,0 +1,15 @@
+{
+  "name": "frontend-service",
+  "version": "1.0.0",
+  "description": "Dummy frontend microservice with /health and /info endpoints",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
