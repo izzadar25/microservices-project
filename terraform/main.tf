@@ -1,0 +1,29 @@
+provider "kind" {}
+
+resource "kind_cluster" "this" {
+  name            = var.cluster_name
+  node_image      = "kindest/node:${var.kubernetes_version}"
+  kubeconfig_path = pathexpand(var.kubeconfig_path)
+  wait_for_ready  = true
+
+  kind_config {
+    kind        = "Cluster"
+    api_version = "kind.x-k8s.io/v1alpha4"
+
+    node {
+      role = "control-plane"
+
+      extra_port_mappings {
+        container_port = 80
+        host_port       = var.ingress_host_port
+      }
+    }
+
+    dynamic "node" {
+      for_each = range(var.worker_node_count)
+      content {
+        role = "worker"
+      }
+    }
+  }
+}
