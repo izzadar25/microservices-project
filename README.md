@@ -96,6 +96,50 @@ kubectl get nodes -o wide
 - [x] `kubectl get nodes` shows control-plane + worker node(s) as `Ready`
 - [x] `kind-microservices-cluster` context available via `kubectl config get-contexts`
 
+---
+
+## Week 3: Kubernetes Manifests, Internal Service Communication, Probes & Resource Limits
+
+### What was added
+- `k8s/` — raw Kubernetes YAML manifests (no Helm yet) for both microservices:
+  - `00-namespace.yaml` — dedicated `microservices-demo` namespace
+  - `01-configmap.yaml` — shared non-sensitive config (app version, backend URL, etc.)
+  - `02-secret.yaml` — dummy Opaque secret (API key, DB password placeholders)
+  - `03/05-*-deployment.yaml` — Deployments for backend/frontend with resource requests/limits and liveness/readiness probes
+  - `04/06-*-service.yaml` — ClusterIP Services enabling internal DNS-based discovery
+
+### New Prerequisites
+None beyond Week 1/2 (`kubectl`, a running kind cluster from Week 2).
+
+### Setup Instructions
+```bash
+# Load locally built images into the kind cluster (kind can't see the Docker Desktop cache directly)
+kind load docker-image frontend-service:1.0.0 --name microservices-cluster
+kind load docker-image backend-service:1.0.0 --name microservices-cluster
+
+# Apply manifests
+kubectl apply -f k8s/
+
+# Verify
+kubectl get all -n microservices-demo
+```
+
+### Verifying Internal Communication
+```bash
+FRONTEND_POD=$(kubectl get pods -n microservices-demo -l app=frontend -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n microservices-demo "$FRONTEND_POD" -- curl -s http://backend:5000/health
+```
+Services communicate over the cluster's internal DNS (`<service-name>.<namespace>.svc.cluster.local`, or just `<service-name>` within the same namespace) — no NodePort or external exposure needed for pod-to-pod traffic.
+
+### Resource Limits & Requests
+| Service | CPU Request | CPU Limit | Memory Request | Memory Limit |
+|---|---|---|---|---|
+| frontend | 50m | 200m | 64Mi | 128Mi |
+| backend | 100m | 300m | 128Mi | 256Mi |
+
+### Probes
+Both services expose `/health` for readiness (checked every 10s, 5s initial delay) and liveness (checked every 20s, 15s initial delay), so Kubernetes only routes traffic to ready pods and restarts unresponsive ones automatically.
+
 ### Note: curl added to runtime images
 The base Dockerfiles from Week 1 didn't include `curl`, so `kubectl exec ... -- curl` failed with
 `executable file not found in $PATH`. Both Dockerfiles were updated to install `curl` in the final
@@ -103,3 +147,9 @@ runtime stage (`apk add --no-cache curl` for the Alpine-based frontend, `apt-get
 the Debian-slim backend), images were rebuilt, reloaded into kind with `kind load docker-image`,
 and Deployments were force-refreshed with `kubectl rollout restart` since the image tag itself
 didn't change.
+
+### Verification Checklist
+- [x] `kubectl apply -f k8s/` completes with no errors
+- [x] Both Deployments show `2/2` ready replicas
+- [x] `kubectl exec` + `curl` confirms frontend and backend reachability over internal DNS
+- [x] `kubectl describe pod` shows configured resource requests/limits and probe results
