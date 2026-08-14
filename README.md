@@ -153,3 +153,82 @@ didn't change.
 - [x] Both Deployments show `2/2` ready replicas
 - [x] `kubectl exec` + `curl` confirms frontend and backend reachability over internal DNS
 - [x] `kubectl describe pod` shows configured resource requests/limits and probe results
+
+---
+
+## Week 4: Helm Chart
+
+### What was added
+- `helm/microservices/` — a Helm chart replacing the raw `k8s/` manifests from Week 3:
+  - `Chart.yaml` — chart metadata
+  - `values.yaml` — all environment-specific configuration (image tags, replica counts, resource limits, probe timings, config/secret values)
+  - `templates/` — parameterized Deployment, Service, ConfigMap, and Secret templates for both services, plus `_helpers.tpl` for shared labels
+- `scripts/helm-upgrade.sh` — lints the chart, then runs `helm upgrade --install`, waits for rollout, and prints release history
+
+### New Prerequisites
+| Tool | Purpose | Check |
+|---|---|---|
+| Helm 3 | Package and deploy the Kubernetes chart | `helm version` |
+
+Install:
+```bash
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+```
+
+### Chart Structure
+
+helm/microservices/
+├── Chart.yaml
+├── values.yaml
+└── templates/
+├── _helpers.tpl
+├── configmap.yaml
+├── secret.yaml
+├── backend-deployment.yaml
+├── backend-service.yaml
+├── frontend-deployment.yaml
+└── frontend-service.yaml
+
+
+### Key values.yaml Variables
+| Variable | Description | Default |
+|---|---|---|
+| `frontend.image.tag` / `backend.image.tag` | Image version to deploy | `1.0.0` |
+| `frontend.replicaCount` / `backend.replicaCount` | Pod replica count | `2` |
+| `frontend.service.port` / `backend.service.port` | Service + container port | `3000` / `5000` |
+| `frontend.resources` / `backend.resources` | CPU/memory requests & limits | see `values.yaml` |
+| `frontend.probes` / `backend.probes` | Liveness/readiness probe timings | see `values.yaml` |
+| `config.*` | Non-sensitive shared config (log level, backend host/port) | see `values.yaml` |
+| `secrets.*` | Dummy secret values (API key, DB password placeholders) | see `values.yaml` |
+
+Override any value at install/upgrade time, e.g.:
+```bash
+helm upgrade --install microservices-demo ./helm/microservices \
+  --namespace microservices-demo --create-namespace \
+  --set frontend.replicaCount=3 --set backend.image.tag=1.1.0
+```
+
+### Install
+```bash
+kubectl delete -f k8s/          # tear down Week 3's raw manifests first (same resource names)
+helm lint ./helm/microservices
+helm install microservices-demo ./helm/microservices --namespace microservices-demo --create-namespace
+```
+
+### Upgrade
+```bash
+./scripts/helm-upgrade.sh                       # uses microservices-demo namespace/release by default
+./scripts/helm-upgrade.sh <namespace> <release>  # or override both
+```
+This runs `helm lint`, then `helm upgrade --install --wait`, then verifies rollout status and prints `helm history`.
+
+### Upgrade Verified
+`values.yaml` `replicaCount` was bumped and the upgrade script re-run; `helm history` showed a new
+revision (1 → 2) with `STATUS: deployed`, and `kubectl get pods` confirmed the pod count matched
+the new value, proving the upgrade path is live and working.
+
+### Verification Checklist
+- [x] `helm lint` passes with no errors
+- [x] `helm install` succeeds and `helm list` shows the release as `deployed`
+- [x] `kubectl exec` + `curl` confirms frontend and backend still reachable under Helm-managed resources
+- [x] Changing a `values.yaml` field and running `./scripts/helm-upgrade.sh` produces a new `helm history` revision and the expected pod count
