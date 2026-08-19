@@ -232,3 +232,243 @@ the new value, proving the upgrade path is live and working.
 - [x] `helm install` succeeds and `helm list` shows the release as `deployed`
 - [x] `kubectl exec` + `curl` confirms frontend and backend still reachable under Helm-managed resources
 - [x] Changing a `values.yaml` field and running `./scripts/helm-upgrade.sh` produces a new `helm history` revision and the expected pod count
+
+
+---
+
+## Week 5: Istio Service Mesh, Automatic Sidecar Injection & Strict mTLS
+
+### What was added
+
+Istio Service Mesh was installed into the existing Kubernetes cluster using Helm to secure and observe communication between the `frontend` and `backend` microservices.
+
+The following components/configurations were added:
+
+- Istio control plane deployed in the `istio-system` namespace
+- Automatic Istio sidecar injection enabled for the `microservices-demo` namespace
+- Istio sidecar proxies (`istio-proxy`) injected into application workloads
+- Strict mutual TLS (mTLS) enabled for the `microservices-demo` namespace
+- Kiali deployed for service mesh visualization
+- Prometheus integrated with Istio telemetry
+- Kiali used to visualize the frontend-to-backend service topology
+- mTLS behavior verified using an intentionally un-injected pod
+
+### Istio Architecture
+
+After Istio was enabled, service-to-service communication follows this architecture:
+
+```text
+                         Istio Service Mesh
+
+        ┌──────────────┐                 ┌──────────────┐
+        │   Frontend   │                 │   Backend    │
+        │              │                 │              │
+        │ Application  │                 │ Application  │
+        │ +            │                 │ +            │
+        │ istio-proxy  │◄──── mTLS ─────►│ istio-proxy  │
+        └──────────────┘                 └──────────────┘
+
+1. Istio Installation
+
+Istio was installed using Helm into the istio-system namespace.
+
+Example installation:
+helm repo add istio https://istio-release.storage.googleapis.com/charts
+helm repo update
+
+helm install istio-base istio/base \
+  -n istio-system --create-namespace
+
+helm install istiod istio/istiod \
+  -n istio-system \
+  --wait
+Installation was verified using:
+
+kubectl get pods -n istio-system
+
+The Istio control plane was confirmed to be running successfully.
+
+2. Automatic Sidecar Injection
+
+Automatic sidecar injection was enabled for the application namespace:
+
+kubectl label namespace microservices-demo istio-injection=enabled
+
+The namespace was verified using:
+
+kubectl get namespace microservices-demo --show-labels
+
+After restarting the application workloads:
+
+kubectl rollout restart deployment -n microservices-demo
+
+the application pods were recreated with Istio sidecars.
+
+Verification:
+
+kubectl get pods -n microservices-demo
+
+Application pods showed 2/2 containers ready, representing:
+
+1. Application container
+2. istio-proxy sidecar
+
+This confirms that automatic sidecar injection is enabled.
+
+3. Strict mTLS Configuration
+
+Strict mutual TLS was configured for the microservices-demo namespace using an Istio PeerAuthentication policy.
+
+The effective policy is:
+
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: microservices-demo
+spec:
+  mtls:
+    mode: STRICT
+
+The configuration was verified using:
+
+kubectl get peerauthentication -n microservices-demo -o yaml
+
+The configuration requires workloads participating in the mesh to use mutual TLS for service-to-service communication.
+
+4. Frontend-to-Backend Communication
+
+The frontend and backend services communicate internally through Kubernetes Services:
+
+frontend:3000
+backend:5000
+
+The backend service was verified using:
+
+kubectl get svc -n microservices-demo
+
+Result:
+
+NAME       TYPE        PORT(S)
+backend    ClusterIP   5000/TCP
+frontend   ClusterIP   3000/TCP
+
+With Istio enabled, the communication path becomes:
+
+Frontend Application
+        |
+        v
+Frontend Istio Proxy
+        |
+        |  mTLS
+        v
+Backend Istio Proxy
+        |
+        v
+Backend Application
+5. mTLS Verification Using an Un-injected Pod
+
+To verify that STRICT mTLS is actually enforced, a temporary pod was created with Istio sidecar injection explicitly disabled.
+
+The pod was verified to contain only its application container and no istio-proxy sidecar.
+
+The un-injected pod attempted to access:
+
+http://backend:5000
+
+The request failed:
+
+* Trying 10.96.225.44:5000...
+* Established connection to backend
+* Recv failure: Connection reset by peer
+curl: (56) Recv failure: Connection reset by peer
+
+This demonstrates that a workload without an Istio sidecar cannot establish the required mTLS communication with the backend.
+
+The temporary test pod was removed after verification:
+
+kubectl delete pod no-istio -n microservices-demo
+6. Before and After Networking Behavior
+Before Istio / mTLS
+
+Before service mesh security was applied, the services communicated using normal Kubernetes networking:
+
+Frontend ───────── Plain HTTP ─────────> Backend
+
+A direct HTTP request could reach the backend without Istio mTLS enforcement.
+
+After Istio + STRICT mTLS
+
+After enabling Istio and STRICT mTLS:
+
+Frontend
+   |
+   v
+Istio Proxy
+   |
+   |  Encrypted + Authenticated mTLS
+   |
+   v
+Istio Proxy
+   |
+   v
+Backend
+
+A pod without an Istio sidecar cannot communicate with the backend using plaintext HTTP:
+
+Un-injected Pod
+      |
+      | Plain HTTP
+      X
+   Backend
+      |
+      └── Connection Reset
+
+This confirms that STRICT mTLS is being enforced.
+
+7. Kiali Service Mesh Visualization
+
+Kiali was deployed to provide visualization and observability of the Istio service mesh.
+
+Kiali was configured to use the Prometheus service:
+
+external_services:
+  istio:
+    root_namespace: istio-system
+
+
+  prometheus:
+    enabled: true
+    url: http://prometheus-server.monitoring:80
+
+Kiali status was verified through its API.
+
+The Kiali environment reported:
+
+Kiali state: running
+Kiali version: v2.30.0
+Prometheus version: 3.14.0
+Istio API: enabled
+warningMessages: []
+
+The Kiali mesh topology showed the communication relationship:
+
+frontend  ─────────>  backend
+
+This provides a visual representation of the application services participating in the Istio mesh.
+
+8. Istio Telemetry in Prometheus
+
+Istio telemetry was verified through Prometheus using:
+
+istio_requests_total
+
+The metric returned real traffic between the microservices.
+
+Relevant labels included:
+
+source_app="frontend"
+destination_app="backend"
+response_code="200"
+request_protocol="http"
+namespace="microservices-demo"
