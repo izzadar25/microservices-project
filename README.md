@@ -232,3 +232,143 @@ the new value, proving the upgrade path is live and working.
 - [x] `helm install` succeeds and `helm list` shows the release as `deployed`
 - [x] `kubectl exec` + `curl` confirms frontend and backend still reachable under Helm-managed resources
 - [x] Changing a `values.yaml` field and running `./scripts/helm-upgrade.sh` produces a new `helm history` revision and the expected pod count
+
+
+
+---
+
+## Week 5: Istio Service Mesh with Strict mTLS
+
+### Overview
+Istio was installed on the local Kubernetes cluster using Helm to add a service mesh layer that handles traffic encryption, identity-based authentication, and network visibility between the `frontend` and `backend` microservices — with zero changes to application code.
+
+### What Was Installed
+
+| Component | Purpose | Installed via |
+|---|---|---|
+| Istio base | Core CRDs and cluster-wide resources | Helm (`istio/base`) |
+| istiod | Istio control plane (manages config, mTLS certificates, sidecars) | Helm (`istio/istiod`) |
+| Prometheus | Metrics backend used by Kiali | Helm (`prometheus-community/prometheus`) |
+| Kiali | Visual service mesh dashboard | Helm (`kiali/kiali-server`) |
+
+### Automatic Sidecar Injection
+
+Automatic sidecar injection was enabled for the `microservices-demo` namespace, so every pod created in that namespace automatically gets an Istio proxy (`istio-proxy`) container attached alongside the application container:
+
+```bash
+kubectl label namespace microservices-demo istio-injection=enabled
+```
+
+Existing `backend` and `frontend` deployments were restarted so they'd pick up the sidecar:
+
+```bash
+kubectl rollout restart deployment backend -n microservices-demo
+kubectl rollout restart deployment frontend -n microservices-demo
+```
+
+Confirmed by pods showing **`2/2`** containers (app + `istio-proxy`) instead of the previous `1/1`.
+
+### Strict mTLS Configuration
+
+A `PeerAuthentication` policy was applied to enforce **STRICT** mTLS mode across the namespace — meaning every connection must be mutually authenticated and encrypted, with no plain-text fallback allowed:
+
+```yaml
+# istio/peer-authentication.yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: microservices-demo
+spec:
+  mtls:
+    mode: STRICT
+```
+
+Applied with:
+```bash
+kubectl apply -f istio/peer-authentication.yaml
+```
+
+### Before / After Networking Behavior
+
+**Before Istio (Week 3):** any pod anywhere in the cluster could freely reach the backend service on port `5000` over plain, unauthenticated HTTP — there was no identity check and no encryption in transit.
+
+**After Istio + Strict mTLS (Week 5):** only pods carrying a valid Istio sidecar (and therefore a valid mTLS certificate issued by `istiod`) can successfully connect to the backend. Any request from outside the mesh is rejected at the network layer before it ever reaches the application.
+
+#### Test 1 — Un-injected pod (no sidecar) attempting to reach the backend
+
+An "outsider" pod was deliberately created without a sidecar to simulate a non-mesh workload:
+
+```bash
+kubectl run curl-test --image=curlimages/curl -n microservices-demo \
+  --labels="sidecar.istio.io/inject=false" \
+  --command -- sleep 3600
+
+kubectl exec curl-test -n microservices-demo -- curl -s -m 5 http://backend:5000/health
+```
+
+**Result:** connection blocked — `command terminated with exit code 56` (connection reset by peer). This confirms strict mTLS successfully rejects any traffic that isn't part of the mesh.
+
+![Blocked request from un-injected pod](docs/screenshots/mtls-blocked-request.png)
+
+#### Test 2 — Frontend pod (with sidecar) reaching the backend
+
+```bash
+kubectl exec <frontend-pod> -n microservices-demo -c frontend -- curl -s -m 5 http://backend:5000/health
+```
+
+**Result:** succeeded — `{"status":"ok","uptimeSeconds":203}`. This confirms properly authenticated, mTLS-encrypted traffic flows normally between services that are part of the mesh.
+
+![Successful request from frontend pod](docs/screenshots/mtls-allowed-request.png)
+
+### Kiali Mesh Topology
+
+Traffic metrics between `frontend` and `backend` after generating test requests — showing 100% success rate and 0% errors:
+
+![Kiali traffic metrics](docs/screenshots/kiali-traffic-metrics.png)
+
+Mesh graph showing padlock icons on both connections between `frontend` and `backend`, confirming mTLS encryption is actively securing that traffic:
+
+![Kiali mesh graph with mTLS padlocks](docs/screenshots/kiali-mesh-graph.png)
+
+### How to Reproduce
+
+```bash
+# 1. Install Istio
+helm repo add istio https://istio-release.storage.googleapis.com/charts
+helm repo update
+kubectl create namespace istio-system
+helm install istio-base istio/base -n istio-system --set defaultRevision=default
+helm install istiod istio/istiod -n istio-system --wait
+
+# 2. Enable automatic sidecar injection
+kubectl label namespace microservices-demo istio-injection=enabled
+kubectl rollout restart deployment backend -n microservices-demo
+kubectl rollout restart deployment frontend -n microservices-demo
+
+# 3. Apply strict mTLS
+kubectl apply -f istio/peer-authentication.yaml
+
+# 4. Install monitoring + Kiali
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm install prometheus prometheus-community/prometheus -n monitoring --set server.persistentVolume.enabled=false
+
+helm repo add kiali https://kiali.org/helm-charts
+helm install kiali-server kiali/kiali-server -n istio-system \
+  --set auth.strategy="anonymous" \
+  --set external_services.prometheus.url="http://prometheus-server.monitoring.svc.cluster.local"
+
+# 5. View the dashboard
+kubectl port-forward -n istio-system svc/kiali 20001:20001
+# then open http://localhost:20001 in a browser
+```
+
+### Verification Checklist
+
+- [x] Istio installed into the cluster via Helm (base + istiod)
+- [x] Automatic sidecar injection enabled for `microservices-demo` namespace
+- [x] Existing deployments restarted and confirmed running with sidecars (`2/2`)
+- [x] Strict mTLS `PeerAuthentication` policy applied and verified
+- [x] Un-injected pod confirmed blocked from reaching the backend
+- [x] Injected frontend pod confirmed able to reach the backend
+- [x] Kiali installed and mesh topology visualized with mTLS padlocks
