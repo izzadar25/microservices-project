@@ -372,3 +372,244 @@ kubectl port-forward -n istio-system svc/kiali 20001:20001
 - [x] Un-injected pod confirmed blocked from reaching the backend
 - [x] Injected frontend pod confirmed able to reach the backend
 - [x] Kiali installed and mesh topology visualized with mTLS padlocks
+
+
+
+---
+
+## Week 6: Kong API Gateway — Ingress, Rate Limiting & API Key Auth
+
+### Overview
+Kong was installed as the single ingress point into the cluster using Helm, replacing direct NodePort access to the `frontend` service. Kong now handles external routing, rate limiting, and API key authentication before any request reaches the microservices — all while staying compatible with the strict mTLS mesh established in Week 5.
+
+### What Was Installed
+
+| Component | Purpose | Installed via |
+|---|---|---|
+| Kong Gateway | Single ingress point / API gateway | Helm (`kong/kong`) |
+| Kong Ingress Controller | Watches Kubernetes Ingress + KongPlugin resources and syncs them to Kong | Bundled with the Kong Helm chart |
+
+Installed into a dedicated `kong` namespace:
+```bash
+helm repo add kong https://charts.konghq.com
+helm repo update
+kubectl create namespace kong
+helm install kong kong/kong -n kong \
+  --set ingressController.installCRDs=false \
+  --set admin.enabled=true \
+  --set admin.type=ClusterIP \
+  --set proxy.type=NodePort
+```
+
+### Routing: Exposing the Frontend
+
+A Kubernetes `Ingress` resource routes all traffic through Kong to the `frontend` service:
+
+```yaml
+# kong/frontend-ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: frontend-ingress
+  namespace: microservices-demo
+  annotations:
+    konghq.com/strip-path: "true"
+    konghq.com/plugins: frontend-rate-limit,frontend-key-auth
+spec:
+  ingressClassName: kong
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 3000
+```
+
+### mTLS Compatibility Note
+
+Kong's pod does not run an Istio sidecar (API gateways typically sit at the mesh edge rather than inside it). Since the Week 5 `PeerAuthentication` policy enforces STRICT mTLS across the `microservices-demo` namespace, a sidecar-less Kong could not reach `frontend` directly. This was resolved with a **port-level PERMISSIVE override** scoped only to the frontend's ingress port, so Kong can reach it over plain HTTP while `frontend ↔ backend` traffic inside the mesh remains fully mTLS-encrypted:
+
+```yaml
+# istio/frontend-permissive.yaml
+apiVersion: security.istio.io/v1
+kind: PeerAuthentication
+metadata:
+  name: frontend-permissive
+  namespace: microservices-demo
+spec:
+  selector:
+    matchLabels:
+      app: frontend
+  mtls:
+    mode: PERMISSIVE
+  portLevelMtls:
+    3000:
+      mode: PERMISSIVE
+```
+
+### Rate Limiting
+
+A `KongPlugin` of type `rate-limiting` was applied, capping traffic at **5 requests per minute** per client:
+
+```yaml
+# kong/rate-limit-plugin.yaml
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: frontend-rate-limit
+  namespace: microservices-demo
+plugin: rate-limiting
+config:
+  minute: 5
+  policy: local
+```
+
+#### Test Script
+
+`kong/test-rate-limit.sh` sends 10 rapid requests to the Kong-proxied endpoint and checks the HTTP status of each:
+
+```bash
+#!/bin/bash
+URL="http://localhost:8000/health"
+TOTAL_REQUESTS=10
+
+for i in $(seq 1 $TOTAL_REQUESTS); do
+  STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+  echo "Request $i: HTTP $STATUS"
+  sleep 0.5
+done
+```
+
+**Result:**
+```
+Request 1:  SUCCESS       (HTTP 200)
+Request 2:  SUCCESS       (HTTP 200)
+Request 3:  SUCCESS       (HTTP 200)
+Request 4:  SUCCESS       (HTTP 200)
+Request 5:  SUCCESS       (HTTP 200)
+Request 6:  RATE LIMITED  (HTTP 429)
+Request 7:  RATE LIMITED  (HTTP 429)
+Request 8:  RATE LIMITED  (HTTP 429)
+Request 9:  RATE LIMITED  (HTTP 429)
+Request 10: RATE LIMITED  (HTTP 429)
+```
+
+The first 5 requests within the minute succeeded; every request after that was correctly rejected with `429 Too Many Requests`, confirming the rate limit is enforced.
+
+### API Key Authentication
+
+A `key-auth` plugin was applied to require a valid API key on the same route:
+
+```yaml
+# kong/key-auth-plugin.yaml
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: frontend-key-auth
+  namespace: microservices-demo
+plugin: key-auth
+config:
+  key_names:
+    - apikey
+```
+
+A `KongConsumer` and a labeled `Secret` provide a demo API key:
+
+```yaml
+# kong/kong-consumer.yaml
+apiVersion: configuration.konghq.com/v1
+kind: KongConsumer
+metadata:
+  name: demo-consumer
+  namespace: microservices-demo
+  annotations:
+    kubernetes.io/ingress.class: kong
+username: demo-consumer
+credentials:
+  - demo-consumer-apikey-secret
+```
+
+```yaml
+# kong/consumer-secret.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: demo-consumer-apikey-secret
+  namespace: microservices-demo
+  labels:
+    konghq.com/credential: key-auth
+type: Opaque
+stringData:
+  kongCredType: key-auth
+  key: my-secret-api-key-12345
+```
+
+#### Test Results
+
+**Without an API key:**
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/health
+```
+```
+401
+```
+
+**With a valid API key:**
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" -H "apikey: my-secret-api-key-12345" http://localhost:8000/health
+```
+```
+200
+```
+
+This confirms the route correctly rejects unauthenticated requests and accepts requests carrying a valid key.
+
+### How to Reproduce
+
+```bash
+# 1. Install Kong
+helm repo add kong https://charts.konghq.com
+helm repo update
+kubectl create namespace kong
+helm install kong kong/kong -n kong \
+  --set ingressController.installCRDs=false \
+  --set admin.enabled=true \
+  --set admin.type=ClusterIP \
+  --set proxy.type=NodePort
+
+# 2. Allow Kong (no sidecar) to reach frontend under strict mesh mTLS
+kubectl apply -f istio/frontend-permissive.yaml
+
+# 3. Apply routing + plugins
+kubectl apply -f kong/rate-limit-plugin.yaml
+kubectl apply -f kong/key-auth-plugin.yaml
+kubectl apply -f kong/consumer-secret.yaml
+kubectl apply -f kong/kong-consumer.yaml
+kubectl apply -f kong/frontend-ingress.yaml
+
+# 4. Access Kong locally
+kubectl port-forward -n kong svc/kong-kong-proxy 8000:80
+
+# 5. Run the rate-limit test
+cd kong
+chmod +x test-rate-limit.sh
+./test-rate-limit.sh
+
+# 6. Test API key auth
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8000/health                                  # expect 401
+curl -s -o /dev/null -w "%{http_code}\n" -H "apikey: my-secret-api-key-12345" http://localhost:8000/health  # expect 200
+```
+
+### Verification Checklist
+
+- [x] Kong installed as the single ingress point via Helm
+- [x] Routing rule exposes `frontend` through Kong
+- [x] Rate-limiting plugin enforces 5 requests/minute
+- [x] Test script confirms `429` after the limit is hit
+- [x] API key authentication enforced on the route
+- [x] Verified `401` without a key and `200` with a valid key
+- [x] Confirmed continued mTLS encryption between `frontend` and `backend` inside the mesh

@@ -1,0 +1,6 @@
+apiVersion: configuration.konghq.com/v1
+kind: KongPlugin
+metadata:
+  name: frontend-key-auth
+  namespace: microservices-demo
+plugin: key-auth
