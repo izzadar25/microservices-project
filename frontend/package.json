@@ -4,7 +4,9 @@
   "description": "Dummy frontend microservice with /health and /info endpoints",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "lint": "eslint .",
+    "test": "jest"
   },
   "engines": {
     "node": ">=18"

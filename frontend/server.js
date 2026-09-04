@@ -1,6 +1,5 @@
 const express = require('express');
 const os = require('os');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SERVICE_NAME = 'frontend';
@@ -30,6 +29,10 @@ app.get('/', (req, res) => {
   res.status(200).send(`Hello from ${SERVICE_NAME} v${VERSION}. Try /health or /info`);
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
-});
+if (require.main === module) {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`[${SERVICE_NAME}] listening on port ${PORT}`);
+  });
+}
+
+module.exports = app;
