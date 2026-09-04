@@ -613,3 +613,58 @@ curl -s -o /dev/null -w "%{http_code}\n" -H "apikey: my-secret-api-key-12345" ht
 - [x] API key authentication enforced on the route
 - [x] Verified `401` without a key and `200` with a valid key
 - [x] Confirmed continued mTLS encryption between `frontend` and `backend` inside the mesh
+
+
+Task 7: CI/CD Pipeline with GitHub Actions
+
+This task sets up a complete CI/CD pipeline for the microservices repository using GitHub Actions, covering automated testing, Docker image builds, and pushing versioned images to GitHub Container Registry (GHCR).
+
+Objectives
+Run linting and unit tests automatically on every push
+Build Docker images for each microservice (backend, frontend)
+Push images to a container registry on main branch merges
+Tag images using the Git commit SHA for traceability
+Verify the pipeline runs successfully and images appear in the registry
+Pipeline Overview
+
+The workflow is defined in .github/workflows/ci.yml and triggers on: push. It consists of the following jobs:
+
+backend-test — installs dependencies and runs lint + unit tests for the backend service
+frontend-test — installs dependencies and runs lint + unit tests for the frontend service
+build-and-push — runs only after both test jobs pass; builds Docker images and pushes them to GHCR
+Steps Followed
+Created the workflow file Added .github/workflows/ci.yml inside the repo, triggered on every push event.
+Configured linting and unit tests
+Added a backend-test job that installs backend dependencies (requirements.txt / package.json depending on the service) and runs the test/lint commands.
+Added a frontend-test job doing the same for the frontend service.
+Both jobs run in parallel and must pass before the build step starts.
+Set up Docker Buildx and GHCR authentication
+Used docker/setup-buildx-action to enable multi-stage/cache-friendly builds.
+Logged in to GHCR using docker/login-action with github.actor and the built-in GITHUB_TOKEN (granted packages: write permission in the workflow file).
+Configured build-and-push job
+Used docker/build-push-action@v6 to build each service's Dockerfile (./backend, ./frontend).
+Set push: true so images are pushed only after a successful build.
+Restricted this job to run only on pushes to main (using an if: github.ref == 'refs/heads/main' condition or a branches: [main] trigger), so it doesn't fire on feature branches.
+Implemented image tagging strategy
+Every image is tagged with two tags:
+latest — always points to the most recent build on main
+${{ github.sha }} (short commit SHA, e.g. 20f39fc) — gives a unique, traceable tag per commit
+Example tag configuration:
+yaml
+     tags: |
+       ghcr.io/<owner>/<repo>/backend:latest
+       ghcr.io/<owner>/<repo>/backend:${{ github.sha }}
+Verified the pipeline
+Pushed a commit to main and confirmed the Actions run showed Success (backend-test, frontend-test, build-and-push all green).
+Confirmed total run duration and that 2 artifacts/images were produced.
+Opened the repository's Packages tab on GitHub and confirmed both backend and frontend images were listed, each with the latest tag and the corresponding commit SHA tag (e.g. 20f39fc).
+Registry Used
+
+GitHub Container Registry (GHCR) — chosen because it integrates natively with GitHub Actions via the built-in GITHUB_TOKEN, avoiding the need for extra secrets.
+
+Result
+Workflow run: Success, total duration ~1m 8s
+Images pushed:
+ghcr.io/<owner>/<repo>/backend:latest and ghcr.io/<owner>/<repo>/backend:<commit-sha>
+ghcr.io/<owner>/<repo>/frontend:latest and ghcr.io/<owner>/<repo>/frontend:<commit-sha>
+Both packages confirmed visible under the GitHub Packages section
