@@ -236,5 +236,205 @@ the new value, proving the upgrade path is live and working.
 
 ---
 
+## Week 10: Alertmanager — Alert Rules, Notifications & Incident Response
+
+### Overview
+Alertmanager was configured to work alongside Prometheus (installed via the `kube-prometheus-stack` Helm chart) to detect abnormal conditions in the cluster and send notifications to an external channel. Three alert rules covering different severity levels were created, a mock notification channel was wired up, an alert was deliberately triggered end-to-end, and a runbook was written documenting the response procedure for each alert.
+
+### What Was Installed
+
+| Component | Purpose | Installed via |
+|---|---|---|
+| Prometheus | Metrics collection and alert rule evaluation | Helm (`prometheus-community/kube-prometheus-stack`) |
+| Alertmanager | Routes firing alerts to notification channels | Bundled with the same Helm chart |
+| Grafana | Dashboarding (bundled, not the focus of this week) | Bundled with the same Helm chart |
+
+```bash
+helm repo update
+kubectl create namespace monitoring
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  -n monitoring \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+  --set grafana.enabled=true
+```
+
+### Notification Channel
+
+A [webhook.site](https://webhook.site) endpoint was used as a mock Slack/webhook receiver — it accepts the same HTTP POST payload Alertmanager would send to a real Slack incoming webhook, without needing a live Slack workspace for this exercise.
+
+Alertmanager's config was overridden via its Kubernetes Secret:
+
+```yaml
+# monitoring/alertmanager-config.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-monitoring-kube-prometheus-alertmanager
+  namespace: monitoring
+type: Opaque
+stringData:
+  alertmanager.yaml: |
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: 'slack-mock'
+      group_by: ['alertname', 'severity']
+      group_wait: 10s
+      group_interval: 30s
+      repeat_interval: 1h
+    receivers:
+      - name: 'slack-mock'
+        webhook_configs:
+          - url: 'https://webhook.site/6bf1d0a0-5584-45fd-acb4-e7199e73d703'
+            send_resolved: true
+```
+
+Applied with:
+```bash
+kubectl apply -f monitoring/alertmanager-config.yaml
+kubectl delete pod -n monitoring -l app.kubernetes.io/name=alertmanager
+```
+
+### Alert Rules
+
+Three alert rules were defined in a `PrometheusRule` resource, covering three severity levels:
+
+| Alert | Severity | Condition |
+|---|---|---|
+| `PodCrashLooping` | critical | A pod restarts more than 3 times in 10 minutes |
+| `HighErrorRate` | high | More than 5% of HTTP requests return 5xx over 5 minutes |
+| `HighLatency` | warning | 95th percentile request latency exceeds 1 second over 5 minutes |
+
+```yaml
+# monitoring/alert-rules.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: microservices-alert-rules
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+    - name: microservices.rules
+      rules:
+        - alert: PodCrashLooping
+          expr: increase(kube_pod_container_status_restarts_total{namespace="microservices-demo"}[10m]) > 3
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash looping"
+            description: "Pod {{ $labels.pod }} in namespace {{ $labels.namespace }} has restarted more than 3 times in the last 10 minutes."
+
+        - alert: HighErrorRate
+          expr: |
+            sum(rate(http_requests_total{status=~"5.."}[5m])) by (namespace)
+            /
+            sum(rate(http_requests_total[5m])) by (namespace) > 0.05
+          for: 5m
+          labels:
+            severity: high
+          annotations:
+            summary: "High error rate detected in {{ $labels.namespace }}"
+            description: "More than 5% of requests are returning 5xx errors in the last 5 minutes."
+
+        - alert: HighLatency
+          expr: |
+            histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, namespace)) > 1
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "High request latency in {{ $labels.namespace }}"
+            description: "95th percentile request latency is above 1 second for the last 5 minutes."
+```
+
+Applied with:
+```bash
+kubectl apply -f monitoring/alert-rules.yaml
+```
+
+> **Note:** `HighErrorRate` and `HighLatency` depend on `http_requests_total` / `http_request_duration_seconds_bucket` metrics, which would require instrumenting the demo Flask/Express apps with a Prometheus client library. They are correctly registered and visible in Prometheus but remain inactive in this environment since the services don't yet expose those metrics. `PodCrashLooping` uses cluster-level metrics (`kube_state_metrics`) that are available out of the box, so it was used for the live trigger test below.
+
+### Runbook
+
+A full runbook (`monitoring/RUNBOOK.md`) documents, for each alert: what it means, why it fires, and the exact response steps an on-call engineer should follow (checking logs, checking rollout history, rolling back, scaling, etc.). See that file for the complete procedures.
+
+### Live Alert Trigger Test
+
+To validate the pipeline end-to-end, a backend pod was deliberately forced into a crash loop:
+
+```bash
+kubectl exec backend-8c5fb57b9-wgpdc -n microservices-demo -c backend -- python3 -c "
+x = []
+while True:
+    x.append(' ' * 10**6)
+"
+```
+
+This repeatedly exhausted the container's memory limit, causing it to be `OOMKilled` and restarted by Kubernetes. Repeating this a few times pushed the pod into `CrashLoopBackOff` with more than 3 restarts within 10 minutes.
+
+**Result:**
+
+| Stage | Observation |
+|---|---|
+| Pod status | `backend-8c5fb57b9-wgpdc` reached `CrashLoopBackOff`, restart count > 3 |
+| Prometheus | `PodCrashLooping` alert moved from `Inactive` → `Pending` → `Firing` |
+| Time to fire | ~2 minutes from condition becoming true (matches the `for: 2m` setting) |
+| Notification | Alertmanager sent a `firing` POST request to the webhook, followed later by a `resolved` POST once the pod stabilized |
+
+Example payload received (trimmed):
+```json
+{
+  "receiver": "slack-mock",
+  "status": "resolved",
+  "alerts": [ ... ]
+}
+```
+
+This confirms the full loop works: **metric breach → alert evaluation → firing → notification delivery → auto-resolve notification**, all without any manual intervention beyond the deliberate fault injection.
+
+### How to Reproduce
+
+```bash
+# 1. Install Prometheus + Alertmanager
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+kubectl create namespace monitoring
+helm install monitoring prometheus-community/kube-prometheus-stack -n monitoring \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false
+
+# 2. Configure the notification channel
+kubectl apply -f monitoring/alertmanager-config.yaml
+kubectl delete pod -n monitoring -l app.kubernetes.io/name=alertmanager
+
+# 3. Apply the alert rules
+kubectl apply -f monitoring/alert-rules.yaml
+
+# 4. View Prometheus alerts
+kubectl port-forward -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090
+# open http://localhost:9090/alerts
+
+# 5. Trigger a test alert
+kubectl exec <backend-pod> -n microservices-demo -c backend -- python3 -c "
+x = []
+while True:
+    x.append(' ' * 10**6)
+"
+# repeat a few times until restarts > 3 within 10 minutes
+```
+
+### Verification Checklist
+
+- [x] Alertmanager configured and connected to Prometheus
+- [x] 3 alert rules created across 3 severity levels (critical, high, warning)
+- [x] Notification channel (mock webhook) configured and verified
+- [x] Runbook written covering meaning and response steps for each alert
+- [x] Alert deliberately triggered (pod OOMKilled repeatedly → CrashLoopBackOff)
+- [x] Confirmed alert transitioned Inactive → Pending → Firing in Prometheus
+- [x] Confirmed both "firing" and "resolved" notifications were delivered to the webhook
+---
+
 
      
